@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.env
+.env.*
+*.log
+/logs/
+# local runtime config (the app writes to the OS config dir by default)
+/config.toml
+/servers.toml
+/local*.toml
+.idea/
+.vscode/
+*.swp
+.DS_Store
