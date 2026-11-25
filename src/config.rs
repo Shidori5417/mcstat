@@ -308,3 +308,303 @@ fn parse_port(raw: &str) -> Result<u16, ConfigError> {
 
     Ok(port)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mcstat-test-{label}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn default_config_round_trip() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.refresh_interval_secs, DEFAULT_REFRESH_SECS);
+        assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(cfg.servers.len(), 3);
+        assert_eq!(cfg.servers[0].name, "Hypixel");
+        assert_eq!(cfg.servers[0].address, "mc.hypixel.net");
+        assert_eq!(cfg.servers[0].port, None);
+        assert_eq!(cfg.servers[1].name, "CubeCraft");
+        assert_eq!(cfg.servers[1].address, "play.cubecraft.net");
+        assert_eq!(cfg.servers[1].port, None);
+        assert_eq!(cfg.servers[2].name, "2b2t");
+        assert_eq!(cfg.servers[2].address, "2b2t.org");
+        assert_eq!(cfg.servers[2].port, None);
+
+        let serialized = toml::to_string_pretty(&cfg).expect("serialize default config");
+        let parsed: AppConfig = toml::from_str(&serialized).expect("deserialize default config");
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn missing_fields_use_defaults() {
+        let empty: AppConfig = toml::from_str("").expect("parse empty toml");
+        assert_eq!(empty.refresh_interval_secs, DEFAULT_REFRESH_SECS);
+        assert_eq!(empty.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert!(empty.servers.is_empty());
+
+        let partial: AppConfig = toml::from_str(
+            r#"
+refresh_interval_secs = 10
+
+[[servers]]
+name = "Local"
+address = "localhost"
+"#,
+        )
+        .expect("parse partial toml");
+        assert_eq!(partial.refresh_interval_secs, 10);
+        assert_eq!(partial.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(partial.servers.len(), 1);
+        assert_eq!(partial.servers[0].port, None);
+    }
+
+    #[test]
+    fn load_or_create_creates_missing_file_and_parents() {
+        let tmp = TempDir::new("config-load-create");
+        let cfg_path = tmp.path().join("nested").join("mcstat").join("config.toml");
+        assert!(!cfg_path.exists());
+
+        let loaded = AppConfig::load_or_create(&cfg_path).expect("load_or_create");
+        assert_eq!(loaded, AppConfig::default());
+        assert!(cfg_path.exists());
+
+        let reloaded = AppConfig::load_or_create(&cfg_path).expect("reload existing");
+        assert_eq!(reloaded, loaded);
+    }
+
+    #[test]
+    fn save_then_load_round_trip() {
+        let tmp = TempDir::new("config-save-load");
+        let cfg_path = tmp.path().join("config.toml");
+
+        let custom = AppConfig {
+            refresh_interval_secs: 15,
+            timeout_secs: 7,
+            servers: vec![
+                ServerConfig {
+                    name: "Survival".to_string(),
+                    address: "play.example.com".to_string(),
+                    port: Some(25566),
+                },
+                ServerConfig {
+                    name: "Creative".to_string(),
+                    address: "::1".to_string(),
+                    port: None,
+                },
+            ],
+        };
+
+        custom.save(&cfg_path).expect("save custom config");
+        assert!(!tmp.path().join("config.toml.tmp").exists());
+
+        let loaded = AppConfig::load_or_create(&cfg_path).expect("load saved config");
+        assert_eq!(loaded, custom);
+    }
+
+    #[test]
+    fn invalid_toml_returns_parse_error_with_path() {
+        let tmp = TempDir::new("config-invalid-toml");
+        let cfg_path = tmp.path().join("config.toml");
+        fs::write(&cfg_path, "refresh_interval_secs = [not valid toml").expect("write bad toml");
+
+        let err = AppConfig::load_or_create(&cfg_path).expect_err("should fail with Parse");
+        match err {
+            ConfigError::Parse { path, .. } => assert_eq!(path, cfg_path),
+            other => panic!("expected ConfigError::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_fails_when_parent_is_regular_file() {
+        let tmp = TempDir::new("config-unwritable");
+        let blocking_file = tmp.path().join("not-a-dir");
+        fs::write(&blocking_file, "file").expect("write blocking file");
+        let cfg_path = blocking_file.join("config.toml");
+
+        let err = AppConfig::default()
+            .save(&cfg_path)
+            .expect_err("save should fail");
+        assert!(matches!(err, ConfigError::Io { .. }));
+    }
+
+    #[test]
+    fn default_path_ends_with_mcstat_config_toml() {
+        if let Ok(path) = AppConfig::default_path() {
+            assert!(path.ends_with(Path::new("mcstat").join("config.toml")));
+        }
+    }
+
+    #[test]
+    fn validate_server_input_valid_cases() {
+        // Basic with trimming and empty port
+        let s = validate_server_input("  Hypixel  ", "  mc.hypixel.net  ", "   ")
+            .expect("valid basic server");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "Hypixel".to_string(),
+                address: "mc.hypixel.net".to_string(),
+                port: None,
+            }
+        );
+
+        // Empty name falls back to address
+        let s = validate_server_input("   ", "play.example.org", "").expect("fallback name");
+        assert_eq!(s.name, "play.example.org");
+        assert_eq!(s.address, "play.example.org");
+        assert_eq!(s.port, None);
+
+        // Explicit port boundaries 1 and 65535
+        let s = validate_server_input("Min", "example.org", "1").expect("port 1");
+        assert_eq!(s.port, Some(1));
+        let s = validate_server_input("Max", "example.org", "65535").expect("port 65535");
+        assert_eq!(s.port, Some(65535));
+
+        // Inline host:port when port field is empty; empty name uses stripped host
+        let s = validate_server_input("", "mc.example.com:25570", "").expect("inline host:port");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "mc.example.com".to_string(),
+                address: "mc.example.com".to_string(),
+                port: Some(25570),
+            }
+        );
+
+        // Bracketed IPv6 with inline port strips brackets
+        let s = validate_server_input("Local6", "[::1]:25565", "").expect("bracketed ipv6 + port");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "Local6".to_string(),
+                address: "::1".to_string(),
+                port: Some(25565),
+            }
+        );
+
+        // Bracketed IPv6 without inline port + fallback name
+        let s = validate_server_input("", "[::1]", "").expect("bracketed ipv6 no port");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "::1".to_string(),
+                address: "::1".to_string(),
+                port: None,
+            }
+        );
+
+        // Bracketed IPv6 without inline port + separate port field
+        let s = validate_server_input("Local6", "[2001:db8::1]", "25566")
+            .expect("bracketed ipv6 + field port");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "Local6".to_string(),
+                address: "2001:db8::1".to_string(),
+                port: Some(25566),
+            }
+        );
+
+        // Bare IPv6 without port
+        let s = validate_server_input("Loopback", "::1", "").expect("bare ipv6");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "Loopback".to_string(),
+                address: "::1".to_string(),
+                port: None,
+            }
+        );
+
+        // Bare IPv6 with explicit port field
+        let s = validate_server_input("Loopback", "2001:db8::1", "25565")
+            .expect("bare ipv6 + field port");
+        assert_eq!(
+            s,
+            ServerConfig {
+                name: "Loopback".to_string(),
+                address: "2001:db8::1".to_string(),
+                port: Some(25565),
+            }
+        );
+    }
+
+    #[test]
+    fn validate_server_input_invalid_cases() {
+        let invalid_cases = [
+            // Empty / whitespace-only address
+            ("Name", "", ""),
+            ("Name", "   ", ""),
+            // Whitespace inside address
+            ("Name", "mc.hypixel. net", ""),
+            ("Name", "mc.hypixel.\tnet", ""),
+            // Invalid ports in port field
+            ("Name", "mc.hypixel.net", "0"),
+            ("Name", "mc.hypixel.net", "65536"),
+            ("Name", "mc.hypixel.net", "999999"),
+            ("Name", "mc.hypixel.net", "abc"),
+            ("Name", "mc.hypixel.net", "-1"),
+            ("Name", "mc.hypixel.net", "+25565"),
+            // Invalid inline ports
+            ("Name", "mc.hypixel.net:0", ""),
+            ("Name", "mc.hypixel.net:65536", ""),
+            ("Name", "mc.hypixel.net:abc", ""),
+            ("Name", "mc.hypixel.net:", ""),
+            ("Name", ":25565", ""),
+            // Port specified in both address and port field
+            ("Name", "mc.hypixel.net:25565", "25565"),
+            ("Name", "mc.hypixel.net:25565", "25566"),
+            ("Name", "[::1]:25565", "25565"),
+            // Malformed IPv6 / brackets
+            ("Name", "[::1", ""),
+            ("Name", "[]:25565", ""),
+            ("Name", "[::1]:", ""),
+            ("Name", "[::1]extra", ""),
+            ("Name", "[not-ipv6]:25565", ""),
+            ("Name", "foo]bar", ""),
+            ("Name", "foo[bar", ""),
+            ("Name", "a:b:c", ""),
+        ];
+
+        for (name, addr, port) in invalid_cases {
+            let err = validate_server_input(name, addr, port).expect_err(&format!(
+                "expected Validation error for ({name:?}, {addr:?}, {port:?})"
+            ));
+            assert!(
+                matches!(err, ConfigError::Validation(_)),
+                "expected Validation for ({name:?}, {addr:?}, {port:?}), got {err:?}"
+            );
+        }
+    }
+}
