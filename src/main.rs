@@ -74,6 +74,7 @@ async fn run(terminal: &mut Tui, mut app: App, settings: PollerSettings) -> Resu
             AppEvent::Input(_) => Action::None, // resize etc.: just redraw
             AppEvent::Tick => {
                 app.expire_message();
+                advance_refresh_clock(&mut app, settings.interval);
                 Action::None
             }
             AppEvent::PollStarted(id) => {
@@ -104,6 +105,16 @@ async fn run(terminal: &mut Tui, mut app: App, settings: PollerSettings) -> Resu
     // The input thread polls `stop` every 100ms; joining is bounded.
     let _ = input_thread.join();
     Ok(())
+}
+
+/// Keep `app.last_refresh` in step with the poller's own interval timer so
+/// the header countdown keeps cycling between automatic refreshes.
+fn advance_refresh_clock(app: &mut App, interval: Duration) {
+    if let Some(last) = app.last_refresh.as_mut() {
+        while last.elapsed() >= interval {
+            *last += interval;
+        }
+    }
 }
 
 /// Blocking crossterm reader on a dedicated OS thread.
