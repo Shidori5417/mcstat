@@ -2,6 +2,7 @@
 //!
 //! OWNERSHIP: Orchestrator (Opus). `feat/cli-tests` may wire CLI options in.
 
+mod cli;
 mod config;
 mod model;
 mod poller;
@@ -10,12 +11,14 @@ mod state;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -25,6 +28,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+use crate::cli::{Cli, run_once};
 use crate::config::AppConfig;
 use crate::model::{Action, AppEvent};
 use crate::poller::{PollerSettings, spawn_poller};
@@ -34,27 +38,39 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// UI tick period (spinner animation, message expiry).
 const TICK: Duration = Duration::from_millis(250);
-/// Retries per server poll before reporting Offline.
+/// Retries per server poll before reporting Offline (default of `--retries`).
 const POLL_RETRIES: u32 = 1;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let config_path = AppConfig::default_path().context("locating config file")?;
+async fn main() -> Result<ExitCode> {
+    let cli = Cli::parse();
+    let config_path = cli.config_path().context("locating config file")?;
+    if cli.print_config_path {
+        println!("{}", config_path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let config = AppConfig::load_or_create(&config_path)
         .with_context(|| format!("loading config {}", config_path.display()))?;
+    let settings = cli.poller_settings(&config);
 
-    let settings = PollerSettings {
-        interval: Duration::from_secs(config.refresh_interval_secs.max(1)),
-        timeout: Duration::from_secs(config.timeout_secs.max(1)),
-        retries: POLL_RETRIES,
-    };
-    let app = App::new(config, config_path);
+    if cli.once {
+        let all_online = run_once(&config.servers, settings).await?;
+        return Ok(if all_online {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+
+    let mut app = App::new(config, config_path);
+    app.refresh_interval_secs = settings.interval.as_secs();
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("initializing terminal")?;
     let result = run(&mut terminal, app, settings).await;
     restore_terminal().context("restoring terminal")?;
-    result
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 async fn run(terminal: &mut Tui, mut app: App, settings: PollerSettings) -> Result<()> {

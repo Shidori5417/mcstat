@@ -10,6 +10,8 @@ mod motd;
 mod popups;
 mod widgets;
 
+pub(crate) use self::widgets::format_address;
+
 use std::time::Instant;
 
 use crossterm::event::KeyEvent;
