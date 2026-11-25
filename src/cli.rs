@@ -74,8 +74,9 @@ pub struct Cli {
     )]
     pub retries: u32,
 
-    /// Query every server once, print a table and exit without starting the TUI.
-    /// Exit status: 0 if every server is online, 1 otherwise.
+    /// Query every server once and print a table, without starting the TUI
+    ///
+    /// Exit status is 0 when every server is online and 1 otherwise.
     #[arg(long)]
     pub once: bool,
 
