@@ -590,3 +590,589 @@ async fn lookup_srv_cached(address: &str, timeout: Duration) -> Option<(String, 
         Ok(Err(_)) | Err(_) => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use serde_json::Value;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    fn cfg(name: &str, address: &str, port: Option<u16>) -> ServerConfig {
+        ServerConfig {
+            name: name.to_string(),
+            address: address.to_string(),
+            port,
+        }
+    }
+
+    fn fake_status(endpoint: &str) -> ServerStatus {
+        ServerStatus {
+            version_name: "1.21.4".to_string(),
+            protocol_version: 769,
+            players_online: 5,
+            players_max: 20,
+            player_sample: vec![],
+            motd: Value::String("Hello".to_string()),
+            latency: Duration::from_millis(12),
+            has_favicon: false,
+            resolved_endpoint: endpoint.to_string(),
+        }
+    }
+
+    struct AbortGuard(Arc<AtomicBool>);
+    impl Drop for AbortGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_target_explicit_port_skips_srv() {
+        let host_target = resolve_target(&cfg("Custom", "play.example.com", Some(25577))).await;
+        assert_eq!(
+            host_target,
+            ResolvedTarget {
+                connect_host: "play.example.com".to_string(),
+                connect_port: 25577,
+                handshake_host: "play.example.com".to_string(),
+                handshake_port: 25577,
+            }
+        );
+
+        let ip_target = resolve_target(&cfg("Local", "127.0.0.1", Some(19132))).await;
+        assert_eq!(ip_target.connect_host, "127.0.0.1");
+        assert_eq!(ip_target.connect_port, 19132);
+        assert_eq!(ip_target.handshake_host, "127.0.0.1");
+        assert_eq!(ip_target.handshake_port, 19132);
+    }
+
+    #[tokio::test]
+    async fn resolve_target_ip_literal_uses_default_port_without_srv() {
+        for ip in ["127.0.0.1", "::1", "[::1]"] {
+            let target = resolve_target(&cfg("IP", ip, None)).await;
+            assert_eq!(
+                target,
+                ResolvedTarget {
+                    connect_host: ip.to_string(),
+                    connect_port: DEFAULT_PORT,
+                    handshake_host: ip.to_string(),
+                    handshake_port: DEFAULT_PORT,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn select_srv_target_picks_lowest_priority_then_highest_weight_and_strips_dot() {
+        let candidates = [
+            SrvCandidate {
+                priority: 20,
+                weight: 100,
+                port: 25565,
+                target: "backup.example.com.".to_string(),
+            },
+            SrvCandidate {
+                priority: 10,
+                weight: 5,
+                port: 25566,
+                target: "low-weight.example.com.".to_string(),
+            },
+            SrvCandidate {
+                priority: 10,
+                weight: 50,
+                port: 25567,
+                target: "winner.example.com.".to_string(),
+            },
+            SrvCandidate {
+                priority: 0,
+                weight: 100,
+                port: 25565,
+                target: ".".to_string(),
+            },
+            SrvCandidate {
+                priority: 0,
+                weight: 100,
+                port: 0,
+                target: "zero-port.example.com.".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            select_srv_target(&candidates),
+            Some(("winner.example.com".to_string(), 25567))
+        );
+        assert_eq!(select_srv_target(&[]), None);
+        assert_eq!(
+            select_srv_target(&[SrvCandidate {
+                priority: 0,
+                weight: 0,
+                port: 25565,
+                target: ".".to_string(),
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn srv_cache_respects_ttl_and_key_normalization() {
+        assert_eq!(srv_cache_key("  Play.Example.COM. "), "play.example.com");
+
+        let mut cache = SrvCache::default();
+        let t0 = Instant::now();
+        cache.insert(
+            "play.example.com".to_string(),
+            Some(("node1.example.com".to_string(), 25566)),
+            t0,
+        );
+        assert_eq!(
+            cache.get("play.example.com", t0 + Duration::from_secs(10)),
+            Some(Some(("node1.example.com".to_string(), 25566)))
+        );
+        assert_eq!(cache.get("play.example.com", t0 + SRV_CACHE_TTL), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires internet access"]
+    async fn resolve_target_real_srv_2b2t() {
+        let target = resolve_target(&cfg("2b2t", "2b2t.org", None)).await;
+        assert_eq!(target.handshake_host, "2b2t.org");
+        assert_eq!(target.connect_host, "connect.2b2t.org");
+        assert_eq!(target.connect_port, 25565);
+        assert_eq!(target.handshake_port, 25565);
+    }
+
+    #[tokio::test]
+    async fn initial_poll_emits_started_and_finished_for_all() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(2),
+            retries: 0,
+        };
+        let servers = vec![
+            (1, cfg("A", "a.example.com", Some(25565))),
+            (2, cfg("B", "b.example.com", Some(25566))),
+        ];
+
+        let handle = spawn_poller_with(settings, servers, tx, |sc, _| async move {
+            Ok::<_, std::convert::Infallible>(fake_status(&sc.address))
+        });
+
+        let mut started = HashSet::new();
+        let mut finished = HashMap::new();
+        while finished.len() < 2 {
+            let ev = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("event within timeout")
+                .expect("channel open");
+            match ev {
+                AppEvent::PollStarted(id) => {
+                    started.insert(id);
+                }
+                AppEvent::PollFinished(res) => {
+                    assert!(
+                        started.contains(&res.id),
+                        "PollFinished arrived before PollStarted for {}",
+                        res.id
+                    );
+                    finished.insert(res.id, res.state);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(started, HashSet::from([1, 2]));
+        assert!(matches!(finished.get(&1), Some(ServerState::Online(_))));
+        assert!(matches!(finished.get(&2), Some(ServerState::Online(_))));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn slow_server_does_not_block_fast_server() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(5),
+            retries: 0,
+        };
+        let servers = vec![
+            (1, cfg("Slow", "slow.example.com", None)),
+            (2, cfg("Fast", "fast.example.com", None)),
+        ];
+
+        let handle = spawn_poller_with(settings, servers, tx, |sc, _| async move {
+            if sc.address.starts_with("slow") {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            Ok::<_, std::convert::Infallible>(fake_status(&sc.address))
+        });
+
+        let mut finished_order = Vec::new();
+        let mut started_before_first_finish = HashSet::new();
+        while finished_order.len() < 2 {
+            let ev = rx.recv().await.expect("event");
+            match ev {
+                AppEvent::PollStarted(id) => {
+                    if finished_order.is_empty() {
+                        started_before_first_finish.insert(id);
+                    }
+                }
+                AppEvent::PollFinished(res) => finished_order.push(res.id),
+                _ => {}
+            }
+        }
+
+        assert_eq!(finished_order, vec![2, 1]);
+        assert_eq!(started_before_first_finish, HashSet::from([1, 2]));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn no_overlapping_polls_on_refresh_all() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(10),
+            retries: 0,
+        };
+
+        let gate = Arc::new(Notify::new());
+        let gate_ref = Arc::clone(&gate);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight_ref = Arc::clone(&in_flight);
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight_ref = Arc::clone(&max_in_flight);
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![(1, cfg("One", "one.example.com", None))],
+            tx,
+            move |sc, _| {
+                let gate = Arc::clone(&gate_ref);
+                let calls = Arc::clone(&calls_ref);
+                let in_flight = Arc::clone(&in_flight_ref);
+                let max_in_flight = Arc::clone(&max_in_flight_ref);
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(cur, Ordering::SeqCst);
+                    if n == 1 {
+                        gate.notified().await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, std::convert::Infallible>(fake_status(&sc.address))
+                }
+            },
+        );
+
+        assert!(matches!(rx.recv().await, Some(AppEvent::PollStarted(1))));
+        tokio::task::yield_now().await;
+
+        // RefreshAll while poll 1 is still in flight must skip server 1.
+        handle.refresh_all();
+        handle.refresh_all();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+
+        gate.notify_one();
+        assert!(matches!(
+            rx.recv().await,
+            Some(AppEvent::PollFinished(PollResult { id: 1, .. }))
+        ));
+
+        // Once finished, RefreshAll polls again.
+        handle.refresh_all();
+        assert!(matches!(rx.recv().await, Some(AppEvent::PollStarted(1))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(AppEvent::PollFinished(PollResult { id: 1, .. }))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn periodic_interval_skips_in_flight_server() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_millis(80),
+            timeout: Duration::from_secs(2),
+            retries: 0,
+        };
+        let slow_calls = Arc::new(AtomicUsize::new(0));
+        let fast_calls = Arc::new(AtomicUsize::new(0));
+        let slow_ref = Arc::clone(&slow_calls);
+        let fast_ref = Arc::clone(&fast_calls);
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![
+                (1, cfg("Slow", "slow.example.com", None)),
+                (2, cfg("Fast", "fast.example.com", None)),
+            ],
+            tx,
+            move |sc, _| {
+                let slow_calls = Arc::clone(&slow_ref);
+                let fast_calls = Arc::clone(&fast_ref);
+                async move {
+                    if sc.address.starts_with("slow") {
+                        slow_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    } else {
+                        fast_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Ok::<_, std::convert::Infallible>(fake_status(&sc.address))
+                }
+            },
+        );
+
+        // Wait for the 80ms interval tick to re-poll server 2 while server 1 (300ms) is in flight.
+        let mut fast_finishes = 0;
+        while fast_finishes < 2 {
+            if let Some(AppEvent::PollFinished(PollResult { id: 2, .. })) = rx.recv().await {
+                fast_finishes += 1;
+            }
+        }
+
+        assert_eq!(fast_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_servers_polls_new_ids_and_drops_removed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(10),
+            retries: 0,
+        };
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let aborted_ref = Arc::clone(&aborted);
+        let fast_calls = Arc::new(AtomicUsize::new(0));
+        let fast_ref = Arc::clone(&fast_calls);
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![
+                (1, cfg("DropMe", "drop.example.com", None)),
+                (2, cfg("KeepMe", "keep.example.com", None)),
+            ],
+            tx,
+            move |sc, _| {
+                let aborted = Arc::clone(&aborted_ref);
+                let fast_calls = Arc::clone(&fast_ref);
+                async move {
+                    if sc.address.starts_with("drop") {
+                        let _guard = AbortGuard(aborted);
+                        std::future::pending::<()>().await;
+                    } else if sc.address.starts_with("keep") {
+                        fast_calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok::<_, std::convert::Infallible>(fake_status(&sc.address))
+                }
+            },
+        );
+
+        let mut saw_keep_finish = false;
+        let mut saw_drop_start = false;
+        while !(saw_keep_finish && saw_drop_start) {
+            match rx.recv().await.expect("event") {
+                AppEvent::PollStarted(1) => saw_drop_start = true,
+                AppEvent::PollFinished(PollResult { id: 2, .. }) => saw_keep_finish = true,
+                _ => {}
+            }
+        }
+
+        handle.set_servers(vec![
+            (2, cfg("KeepMe", "keep.example.com", None)),
+            (3, cfg("NewOne", "new.example.com", None)),
+        ]);
+
+        let mut saw_new_start = false;
+        let mut saw_new_finish = false;
+        while !(saw_new_start && saw_new_finish) {
+            match rx.recv().await.expect("event") {
+                AppEvent::PollStarted(3) => saw_new_start = true,
+                AppEvent::PollFinished(PollResult { id: 3, .. }) => saw_new_finish = true,
+                AppEvent::PollFinished(PollResult { id: 1, .. }) => {
+                    panic!("removed server 1 must not emit PollFinished after abort");
+                }
+                _ => {}
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(aborted.load(Ordering::SeqCst));
+        assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retries_with_backoff_then_offline() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(1),
+            retries: 2,
+        };
+        let attempt_times = Arc::new(Mutex::new(Vec::new()));
+        let attempt_times_ref = Arc::clone(&attempt_times);
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![(1, cfg("Down", "down.example.com", None))],
+            tx,
+            move |_, _| {
+                let attempt_times = Arc::clone(&attempt_times_ref);
+                async move {
+                    attempt_times.lock().expect("lock").push(Instant::now());
+                    Err::<ServerStatus, _>("connection refused")
+                }
+            },
+        );
+
+        assert!(matches!(rx.recv().await, Some(AppEvent::PollStarted(1))));
+        let finished = match rx.recv().await {
+            Some(AppEvent::PollFinished(res)) => res,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(finished.id, 1);
+        assert_eq!(
+            finished.state,
+            ServerState::Offline {
+                error: "connection refused".to_string(),
+            }
+        );
+
+        {
+            let times = attempt_times.lock().expect("lock");
+            assert_eq!(times.len(), 3);
+            assert!(times[1].duration_since(times[0]) >= Duration::from_millis(280));
+            assert!(times[2].duration_since(times[1]) >= Duration::from_millis(580));
+        }
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failure_and_timeout_bounds_attempts() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_millis(150),
+            retries: 1,
+        };
+
+        let server1_attempts = Arc::new(AtomicUsize::new(0));
+        let s1_ref = Arc::clone(&server1_attempts);
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![
+                (1, cfg("Flaky", "flaky.example.com", None)),
+                (2, cfg("Hung", "hung.example.com", None)),
+            ],
+            tx,
+            move |sc, _| {
+                let s1_attempts = Arc::clone(&s1_ref);
+                async move {
+                    if sc.address.starts_with("flaky") {
+                        let attempt = s1_attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            Err("temporary reset")
+                        } else {
+                            Ok(fake_status(&sc.address))
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(fake_status(&sc.address))
+                    }
+                }
+            },
+        );
+
+        let mut results = HashMap::new();
+        while results.len() < 2 {
+            if let Some(AppEvent::PollFinished(res)) = rx.recv().await {
+                results.insert(res.id, res.state);
+            }
+        }
+
+        assert!(matches!(results.get(&1), Some(ServerState::Online(_))));
+        assert_eq!(
+            results.get(&2),
+            Some(&ServerState::Offline {
+                error: "connection timed out".to_string(),
+            })
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_promptly_with_hung_poll() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(30),
+            retries: 0,
+        };
+        let aborted = Arc::new(AtomicBool::new(false));
+        let aborted_ref = Arc::clone(&aborted);
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![(1, cfg("Hung", "hung.example.com", None))],
+            tx,
+            move |_, _| {
+                let aborted = Arc::clone(&aborted_ref);
+                async move {
+                    let _guard = AbortGuard(aborted);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok::<_, std::convert::Infallible>(fake_status("hung"))
+                }
+            },
+        );
+
+        assert!(matches!(rx.recv().await, Some(AppEvent::PollStarted(1))));
+        let started = Instant::now();
+        handle.shutdown().await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(aborted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn poller_stops_when_event_receiver_dropped() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let settings = PollerSettings {
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(1),
+            retries: 0,
+        };
+
+        let handle = spawn_poller_with(
+            settings,
+            vec![(1, cfg("S", "s.example.com", None))],
+            tx,
+            |sc, _| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, std::convert::Infallible>(fake_status(&sc.address))
+            },
+        );
+
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), handle.task)
+            .await
+            .expect("poller task must exit when receiver is dropped")
+            .expect("poller task should not panic");
+    }
+}
