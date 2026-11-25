@@ -2,19 +2,20 @@
 //!
 //! OWNERSHIP: Gemini 4 (`feat/tui-ui`).
 //! Public signatures below are the contract; bodies are implemented across
-//! submodules in `src/ui/` while re-exporting the exact entry points
+//! submodules in `src/ui/` while keeping the entry points available as
 //! `crate::ui::{draw, handle_key, motd_to_lines, motd_plain}`.
 
+mod input;
 mod motd;
+mod popups;
 mod widgets;
 
 use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
+use ratatui::text::Line;
 
-#[allow(unused_imports)]
-pub use self::motd::{motd_plain, motd_to_lines};
 use self::widgets::{RenderView, draw_view, wall_clock_millis};
 use crate::model::Action;
 use crate::state::App;
@@ -51,6 +52,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// n/Esc cancel.
 /// Help: any key closes.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
-    let _ = (app, key);
-    Action::None
+    input::handle_key(app, key)
+}
+
+/// Convert a Minecraft MOTD (`description`) into styled lines.
+/// Supports: plain JSON string with legacy `§` codes (0-9a-f colors,
+/// k obfuscated, l bold, m strikethrough, n underline, o italic, r reset),
+/// chat component objects (`text`, `color` incl. named colors and `#RRGGBB`,
+/// `bold`/`italic`/`underlined`/`strikethrough`/`obfuscated`, `extra` with
+/// style inheritance, `translate` fallback to the key), arrays of components,
+/// and `\n` line breaks.
+pub fn motd_to_lines(motd: &serde_json::Value) -> Vec<Line<'static>> {
+    motd::motd_to_lines(motd)
+}
+
+/// Plain-text version of the MOTD (formatting removed, lines joined by
+/// a space) for the narrow table column.
+pub fn motd_plain(motd: &serde_json::Value) -> String {
+    motd::motd_plain(motd)
 }

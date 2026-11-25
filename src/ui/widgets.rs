@@ -10,7 +10,9 @@ use ratatui::widgets::{
     Block, BorderType, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
 
-use super::motd::{motd_plain, motd_to_lines, strip_legacy_codes};
+use super::motd::strip_legacy_codes;
+use super::popups::draw_popup;
+use super::{motd_plain, motd_to_lines};
 use crate::model::{ServerConfig, ServerState};
 use crate::state::{App, MessageKind, Mode, ServerEntry, StatusMessage};
 
@@ -81,7 +83,6 @@ pub(crate) struct RenderView<'a> {
     pub refresh_interval_secs: u64,
     pub last_refresh: Option<Instant>,
     pub message: Option<&'a StatusMessage>,
-    #[allow(dead_code)]
     pub mode: &'a Mode,
 }
 
@@ -173,7 +174,6 @@ pub(crate) fn seconds_until_refresh(
 
 /// Center a rectangle of at most `(target_width, target_height)` within `area`.
 /// Safe for arbitrarily small or zero-sized areas.
-#[allow(dead_code)]
 pub(crate) fn centered_rect(area: Rect, target_width: u16, target_height: u16) -> Rect {
     let width = target_width.min(area.width);
     let height = target_height.min(area.height);
@@ -199,6 +199,7 @@ pub(crate) fn draw_view(
     if area.height < 3 {
         // Ultra-short viewport: prioritize rendering the main content without panicking.
         draw_main(frame, area, view, now, now_epoch_ms);
+        draw_popup(frame, area, view.mode, view.servers);
         return;
     }
 
@@ -212,6 +213,7 @@ pub(crate) fn draw_view(
     draw_header(frame, header_area, view, now);
     draw_main(frame, main_area, view, now, now_epoch_ms);
     draw_footer(frame, footer_area, view);
+    draw_popup(frame, area, view.mode, view.servers);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, view: &RenderView<'_>, now: Instant) {
