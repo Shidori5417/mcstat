@@ -2,6 +2,12 @@
 name = "mcstat"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Live terminal monitor for Minecraft Java Edition servers (Server List Ping, SRV, parallel polling)"
+readme = "README.md"
+license = "MIT"
+keywords = ["minecraft", "tui", "ratatui", "server-status", "monitoring"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.105"
