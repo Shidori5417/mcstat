@@ -154,15 +154,17 @@ fn spawn_ticker(tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<
 
 fn setup_terminal() -> io::Result<Tui> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
-        let _ = disable_raw_mode();
-        return Err(e);
-    }
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    terminal.hide_cursor()?;
-    terminal.clear()?;
-    Ok(terminal)
+    let init = || -> io::Result<Tui> {
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        terminal.hide_cursor()?;
+        terminal.clear()?;
+        Ok(terminal)
+    };
+    // Never leave the shell in raw mode / alternate screen on a failed init.
+    init().inspect_err(|_| {
+        let _ = restore_terminal();
+    })
 }
 
 fn restore_terminal() -> io::Result<()> {
