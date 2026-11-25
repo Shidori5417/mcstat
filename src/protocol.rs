@@ -5,12 +5,13 @@
 //! Extra private helpers / extra pub items are allowed.
 //! Spec: https://minecraft.wiki/w/Java_Edition_protocol/Server_List_Ping
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::model::ServerStatus;
 
@@ -223,14 +224,143 @@ pub async fn query_status(
     handshake_port: u16,
     timeout: Duration,
 ) -> Result<ServerStatus, ProtocolError> {
-    let _ = (
+    let started = Instant::now();
+    let exchange = exchange(
         connect_host,
         connect_port,
         handshake_host,
         handshake_port,
+        started,
         timeout,
     );
-    todo!("feat/protocol")
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| ProtocolError::Timeout)?
+}
+
+/// Packet id of Status Request / Status Response.
+const PACKET_STATUS: i32 = 0x00;
+/// Packet id of Ping Request / Pong Response.
+const PACKET_PING: i32 = 0x01;
+
+/// The un-timed body of [`query_status`]. `started`/`budget` only serve to
+/// size the ping sub-timeout so a silent ping can never eat the whole budget.
+async fn exchange(
+    connect_host: &str,
+    connect_port: u16,
+    handshake_host: &str,
+    handshake_port: u16,
+    started: Instant,
+    budget: Duration,
+) -> Result<ServerStatus, ProtocolError> {
+    // `TcpStream::connect` wants a bare IPv6 literal, without brackets.
+    let bare_host = connect_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(connect_host);
+    let mut stream = TcpStream::connect((bare_host, connect_port)).await?;
+    stream.set_nodelay(true)?;
+
+    // Handshake + Status Request (length 1, id 0x00) in a single write.
+    let mut out = build_handshake(handshake_host, handshake_port);
+    out.extend_from_slice(&[0x01, PACKET_STATUS as u8]);
+    let sent = Instant::now();
+    stream.write_all(&out).await?;
+    stream.flush().await?;
+
+    let (id, payload) = read_packet(&mut stream).await?;
+    if id != PACKET_STATUS {
+        return Err(ProtocolError::UnexpectedPacket(id));
+    }
+    let status_rtt = sent.elapsed();
+    let json = read_string(&payload)?;
+
+    let endpoint = format_endpoint(bare_host, connect_port);
+    let mut status = parse_status_json(json, status_rtt, &endpoint)?;
+
+    // Ping/Pong is best effort: on any failure keep the status round trip.
+    let ping_budget = budget.saturating_sub(started.elapsed()) / 2;
+    if let Ok(Ok(rtt)) = tokio::time::timeout(ping_budget, ping(&mut stream)).await {
+        status.latency = rtt;
+    }
+    Ok(status)
+}
+
+/// Send a Ping Request and wait for the matching Pong; returns the round trip.
+async fn ping<S>(stream: &mut S) -> Result<Duration, ProtocolError>
+where
+    S: AsyncRead + AsyncWriteExt + Unpin,
+{
+    let token = ping_token();
+    let mut packet = Vec::with_capacity(10);
+    write_varint(&mut packet, 9); // id (1 byte) + i64 payload (8 bytes)
+    write_varint(&mut packet, PACKET_PING);
+    packet.extend_from_slice(&token.to_be_bytes());
+
+    let sent = Instant::now();
+    stream.write_all(&packet).await?;
+    stream.flush().await?;
+    let (id, payload) = read_packet(stream).await?;
+    let rtt = sent.elapsed();
+    if id != PACKET_PING {
+        return Err(ProtocolError::UnexpectedPacket(id));
+    }
+    if payload.as_slice() != token.to_be_bytes() {
+        return Err(ProtocolError::Malformed("pong payload mismatch".into()));
+    }
+    Ok(rtt)
+}
+
+/// Arbitrary payload for the ping; the server must echo it back.
+fn ping_token() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Read one length-prefixed packet; returns `(packet_id, remaining_payload)`.
+async fn read_packet<R>(reader: &mut R) -> Result<(i32, Vec<u8>), ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    let len = read_varint_async(reader).await?;
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&l| l > 0)
+        .ok_or_else(|| ProtocolError::Malformed(format!("invalid packet length {len}")))?;
+    if len > MAX_PACKET_LEN {
+        return Err(ProtocolError::PacketTooLarge(len));
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    let (id, used) =
+        read_varint(&buf)?.ok_or_else(|| ProtocolError::Malformed("truncated packet id".into()))?;
+    let payload = buf.get(used..).map(<[u8]>::to_vec).unwrap_or_default();
+    Ok((id, payload))
+}
+
+/// Decode a Minecraft String (VarInt byte length + UTF-8) from the start of `payload`.
+fn read_string(payload: &[u8]) -> Result<&str, ProtocolError> {
+    let (len, used) = read_varint(payload)?
+        .ok_or_else(|| ProtocolError::Malformed("truncated string length".into()))?;
+    let len = usize::try_from(len)
+        .map_err(|_| ProtocolError::Malformed(format!("negative string length {len}")))?;
+    let bytes = used
+        .checked_add(len)
+        .and_then(|end| payload.get(used..end))
+        .ok_or_else(|| ProtocolError::Malformed("string longer than packet".into()))?;
+    std::str::from_utf8(bytes)
+        .map_err(|e| ProtocolError::Malformed(format!("status is not valid UTF-8: {e}")))
+}
+
+/// `host:port`, with IPv6 literals wrapped in brackets.
+fn format_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +563,241 @@ mod tests {
             let err = parse_status_json(bad, Duration::ZERO, EP).expect_err(bad);
             assert!(matches!(err, ProtocolError::Malformed(_)), "{bad}: {err}");
         }
+    }
+
+    // ----- query_status against an in-process fake server -----
+
+    use tokio::net::TcpListener;
+
+    #[derive(Clone, Copy)]
+    enum Fake {
+        /// Full protocol: status response, then echo the pong.
+        Normal,
+        /// Accept, read, never answer.
+        Silent,
+        /// Answer the status, then close the connection.
+        CloseAfterStatus,
+        /// Answer the status, then ignore the ping.
+        IgnorePing,
+        /// Answer with a wrong packet id.
+        WrongId,
+        /// Announce a packet bigger than `MAX_PACKET_LEN`.
+        Oversized,
+    }
+
+    const FAKE_JSON: &str = r#"{"version":{"name":"Fake 1.21","protocol":769},
+        "players":{"max":10,"online":3,"sample":[{"name":"Alex","id":"x"}]},
+        "description":"§6Fake server","favicon":"data:image/png;base64,AA=="}"#;
+
+    fn packet(id: i32, body: &[u8]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        write_varint(&mut inner, id);
+        inner.extend_from_slice(body);
+        let mut out = Vec::new();
+        write_varint(&mut out, inner.len() as i32);
+        out.extend_from_slice(&inner);
+        out
+    }
+
+    /// Spawn a one-shot fake server; returns its port and a handle yielding
+    /// the handshake packet (id, payload) it received.
+    async fn spawn_fake(mode: Fake) -> (u16, tokio::task::JoinHandle<Option<(Vec<u8>, Vec<u8>)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.ok()?;
+            let (hs_id, hs_payload) = read_packet(&mut sock).await.ok()?;
+            assert_eq!(hs_id, 0x00);
+            let (req_id, req_payload) = read_packet(&mut sock).await.ok()?;
+            assert_eq!(req_id, 0x00);
+            assert!(req_payload.is_empty());
+            match mode {
+                Fake::Silent => {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                Fake::Oversized => {
+                    let mut len = Vec::new();
+                    write_varint(&mut len, MAX_PACKET_LEN as i32 + 1);
+                    sock.write_all(&len).await.ok()?;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                Fake::WrongId => {
+                    sock.write_all(&packet(0x42, b"hi")).await.ok()?;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                Fake::Normal | Fake::CloseAfterStatus | Fake::IgnorePing => {
+                    let mut body = Vec::new();
+                    write_string(&mut body, FAKE_JSON);
+                    sock.write_all(&packet(0x00, &body)).await.ok()?;
+                    match mode {
+                        Fake::Normal => {
+                            let (id, payload) = read_packet(&mut sock).await.ok()?;
+                            assert_eq!(id, 0x01);
+                            sock.write_all(&packet(0x01, &payload)).await.ok()?;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Fake::IgnorePing => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some((hs_id.to_be_bytes().to_vec(), hs_payload))
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn query_status_full_exchange() {
+        let (port, server) = spawn_fake(Fake::Normal).await;
+        let st = query_status(
+            "127.0.0.1",
+            port,
+            "play.example.com",
+            25565,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("status");
+        assert_eq!(st.version_name, "Fake 1.21");
+        assert_eq!(st.protocol_version, 769);
+        assert_eq!(st.players_online, 3);
+        assert_eq!(st.players_max, 10);
+        assert_eq!(st.player_sample, vec!["Alex"]);
+        assert_eq!(st.motd, Value::String("§6Fake server".into()));
+        assert!(st.has_favicon);
+        assert_eq!(st.resolved_endpoint, format!("127.0.0.1:{port}"));
+        assert!(st.latency < Duration::from_secs(1));
+
+        // The handshake used the handshake host/port, not the connect target.
+        let (_, hs_payload) = server.await.expect("join").expect("handshake seen");
+        let full = build_handshake("play.example.com", 25565);
+        let (_, skip) = read_varint(&full).expect("ok").expect("complete");
+        assert_eq!(&hs_payload[..], &full[skip + 1..]);
+    }
+
+    #[tokio::test]
+    async fn query_status_times_out_on_silent_server() {
+        let (port, _server) = spawn_fake(Fake::Silent).await;
+        let started = Instant::now();
+        let err = query_status(
+            "127.0.0.1",
+            port,
+            "127.0.0.1",
+            port,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("timeout");
+        assert!(matches!(err, ProtocolError::Timeout), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn query_status_falls_back_when_connection_closes_after_status() {
+        let (port, _server) = spawn_fake(Fake::CloseAfterStatus).await;
+        let st = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect("status despite closed connection");
+        assert_eq!(st.players_online, 3);
+        assert!(st.latency < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn query_status_falls_back_when_ping_is_ignored() {
+        let (port, _server) = spawn_fake(Fake::IgnorePing).await;
+        let started = Instant::now();
+        let st = query_status(
+            "127.0.0.1",
+            port,
+            "127.0.0.1",
+            port,
+            Duration::from_millis(600),
+        )
+        .await
+        .expect("status despite unanswered ping");
+        assert_eq!(st.version_name, "Fake 1.21");
+        assert!(started.elapsed() < Duration::from_millis(600));
+    }
+
+    #[tokio::test]
+    async fn query_status_rejects_unexpected_packet_id() {
+        let (port, _server) = spawn_fake(Fake::WrongId).await;
+        let err = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect_err("wrong id");
+        assert!(
+            matches!(err, ProtocolError::UnexpectedPacket(0x42)),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_rejects_oversized_packet() {
+        let (port, _server) = spawn_fake(Fake::Oversized).await;
+        let err = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect_err("too large");
+        assert!(
+            matches!(err, ProtocolError::PacketTooLarge(n) if n == MAX_PACKET_LEN + 1),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_connection_refused_is_io_error() {
+        // Bind then drop to obtain a port nobody listens on.
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let err = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ProtocolError::Io(_)), "{err}");
+    }
+
+    #[test]
+    fn endpoint_brackets_ipv6() {
+        assert_eq!(
+            format_endpoint("mc.example.com", 25565),
+            "mc.example.com:25565"
+        );
+        assert_eq!(format_endpoint("1.2.3.4", 1), "1.2.3.4:1");
+        assert_eq!(format_endpoint("::1", 25565), "[::1]:25565");
+    }
+
+    #[test]
+    fn read_string_validates_lengths() {
+        let mut ok = Vec::new();
+        write_string(&mut ok, "héllo");
+        assert_eq!(read_string(&ok).expect("ok"), "héllo");
+        assert!(matches!(read_string(&[]), Err(ProtocolError::Malformed(_))));
+        assert!(matches!(
+            read_string(&[5, b'a']),
+            Err(ProtocolError::Malformed(_))
+        ));
+        assert!(matches!(
+            read_string(&[1, 0xff]),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+
+    /// Real-world smoke test; needs network access.
+    #[tokio::test]
+    #[ignore = "requires internet access"]
+    async fn real_server_hypixel() {
+        let st = query_status(
+            "mc.hypixel.net",
+            25565,
+            "mc.hypixel.net",
+            25565,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("hypixel status");
+        println!("{st:#?}");
+        assert!(st.players_online > 0);
     }
 }
