@@ -438,3 +438,29 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_input_tail_clips_and_handles_unicode() {
+        assert_eq!(visible_input_tail("", 10), ("", 0));
+        assert_eq!(visible_input_tail("abc", 0), ("", 0));
+        assert_eq!(visible_input_tail("abc", 1), ("", 0));
+        assert_eq!(
+            visible_input_tail("mc.hypixel.net", 20),
+            ("mc.hypixel.net", 14)
+        );
+
+        // Scrolls to keep trailing chars + 1 cursor cell inside `max_cols`
+        let (tail, width) = visible_input_tail("play.very-long-domain.example.net", 12);
+        assert_eq!(tail, "example.net");
+        assert_eq!(width, 11);
+
+        // Multi-byte UTF-8 never panics on char boundaries
+        let (utf8_tail, utf8_w) = visible_input_tail("sunucu-şğüöç", 6);
+        assert_eq!(utf8_tail, "şğüöç");
+        assert_eq!(utf8_w, 5);
+    }
+}

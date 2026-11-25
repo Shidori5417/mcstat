@@ -109,13 +109,13 @@ pub(crate) const fn is_side_by_side(width: u16) -> bool {
 /// Select visible table columns for a given table area width.
 /// Progressively hides MOTD, then Version, then Address, and finally metrics on tiny widths.
 pub(crate) const fn columns_for_width(width: u16) -> &'static [TableColumn] {
-    if width >= 76 {
+    if width >= 92 {
         COLS_ALL
-    } else if width >= 64 {
+    } else if width >= 70 {
         COLS_NO_MOTD
-    } else if width >= 48 {
+    } else if width >= 52 {
         COLS_NO_VERSION
-    } else if width >= 30 {
+    } else if width >= 32 {
         COLS_CORE
     } else {
         COLS_TINY
@@ -384,11 +384,11 @@ const fn column_constraint(col: TableColumn) -> Constraint {
     match col {
         TableColumn::Status => Constraint::Length(9),
         TableColumn::Name => Constraint::Fill(2),
-        TableColumn::Address => Constraint::Fill(2),
+        TableColumn::Address => Constraint::Fill(5),
         TableColumn::Ping => Constraint::Length(7),
-        TableColumn::Players => Constraint::Length(11),
+        TableColumn::Players => Constraint::Length(12),
         TableColumn::Version => Constraint::Length(12),
-        TableColumn::Motd => Constraint::Fill(3),
+        TableColumn::Motd => Constraint::Fill(5),
     }
 }
 
@@ -739,5 +739,155 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &RenderView<'_>) {
         let mut padded = vec![Span::raw(" ")];
         padded.extend(hints_line.spans);
         frame.render_widget(Paragraph::new(Line::from(padded)).style(bar_bg), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn progressive_column_hiding_by_width() {
+        assert_eq!(
+            columns_for_width(120),
+            &[
+                TableColumn::Status,
+                TableColumn::Name,
+                TableColumn::Address,
+                TableColumn::Ping,
+                TableColumn::Players,
+                TableColumn::Version,
+                TableColumn::Motd,
+            ]
+        );
+        assert_eq!(columns_for_width(92).last(), Some(&TableColumn::Motd));
+
+        // First hide MOTD
+        let w80 = columns_for_width(80);
+        assert!(!w80.contains(&TableColumn::Motd));
+        assert!(w80.contains(&TableColumn::Version));
+        assert!(w80.contains(&TableColumn::Address));
+
+        // Next hide Version
+        let w60 = columns_for_width(60);
+        assert!(!w60.contains(&TableColumn::Motd));
+        assert!(!w60.contains(&TableColumn::Version));
+        assert!(w60.contains(&TableColumn::Address));
+
+        // Next hide Address
+        let w40 = columns_for_width(40);
+        assert_eq!(
+            w40,
+            &[
+                TableColumn::Status,
+                TableColumn::Name,
+                TableColumn::Ping,
+                TableColumn::Players,
+            ]
+        );
+
+        // Tiny terminal fallback
+        assert_eq!(
+            columns_for_width(20),
+            &[TableColumn::Status, TableColumn::Name]
+        );
+        assert_eq!(
+            columns_for_width(0),
+            &[TableColumn::Status, TableColumn::Name]
+        );
+    }
+
+    #[test]
+    fn side_by_side_threshold_is_110_cols() {
+        assert!(!is_side_by_side(0));
+        assert!(!is_side_by_side(80));
+        assert!(!is_side_by_side(109));
+        assert!(is_side_by_side(110));
+        assert!(is_side_by_side(160));
+    }
+
+    #[test]
+    fn ping_color_thresholds() {
+        assert_eq!(ping_color(0), Color::Green);
+        assert_eq!(ping_color(45), Color::Green);
+        assert_eq!(ping_color(79), Color::Green);
+
+        assert_eq!(ping_color(80), Color::Yellow);
+        assert_eq!(ping_color(150), Color::Yellow);
+        assert_eq!(ping_color(199), Color::Yellow);
+
+        assert_eq!(ping_color(200), Color::Red);
+        assert_eq!(ping_color(500), Color::Red);
+    }
+
+    #[test]
+    fn spinner_frame_cycles_deterministically() {
+        assert_eq!(spinner_frame(0), "⠋");
+        assert_eq!(spinner_frame(SPINNER_STEP_MS - 1), "⠋");
+        assert_eq!(spinner_frame(SPINNER_STEP_MS), "⠙");
+        assert_eq!(spinner_frame(SPINNER_STEP_MS * 9), "⠏");
+        assert_eq!(spinner_frame(SPINNER_STEP_MS * 10), "⠋");
+        // Never panics on extreme timestamps
+        let _ = spinner_frame(u128::MAX);
+    }
+
+    #[test]
+    fn format_address_handles_ports_and_ipv6() {
+        let srv = ServerConfig {
+            name: "Hypixel".into(),
+            address: "mc.hypixel.net".into(),
+            port: None,
+        };
+        assert_eq!(format_address(&srv), "mc.hypixel.net");
+
+        let custom = ServerConfig {
+            name: "Local".into(),
+            address: "127.0.0.1".into(),
+            port: Some(25566),
+        };
+        assert_eq!(format_address(&custom), "127.0.0.1:25566");
+
+        let ipv6_raw = ServerConfig {
+            name: "V6".into(),
+            address: "::1".into(),
+            port: Some(25565),
+        };
+        assert_eq!(format_address(&ipv6_raw), "[::1]:25565");
+
+        let ipv6_bracketed = ServerConfig {
+            name: "V6B".into(),
+            address: "[2001:db8::1]".into(),
+            port: Some(25565),
+        };
+        assert_eq!(format_address(&ipv6_bracketed), "[2001:db8::1]:25565");
+    }
+
+    #[test]
+    fn seconds_until_refresh_counts_down_and_saturates() {
+        let start = Instant::now();
+        assert_eq!(seconds_until_refresh(5, None, start), None);
+        assert_eq!(seconds_until_refresh(5, Some(start), start), Some(5));
+        assert_eq!(
+            seconds_until_refresh(5, Some(start), start + Duration::from_secs(2)),
+            Some(3)
+        );
+        assert_eq!(
+            seconds_until_refresh(5, Some(start), start + Duration::from_secs(9)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn centered_rect_stays_within_bounds_on_tiny_areas() {
+        let big = Rect::new(0, 0, 100, 40);
+        assert_eq!(centered_rect(big, 50, 14), Rect::new(25, 13, 50, 14));
+
+        let tiny = Rect::new(0, 0, 20, 5);
+        assert_eq!(centered_rect(tiny, 56, 15), Rect::new(0, 0, 20, 5));
+
+        let empty = Rect::ZERO;
+        assert_eq!(centered_rect(empty, 50, 10), Rect::ZERO);
     }
 }

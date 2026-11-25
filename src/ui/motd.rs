@@ -626,4 +626,41 @@ mod tests {
         assert_eq!(strip_legacy_codes("Trailing§"), "Trailing");
         assert_eq!(strip_legacy_codes("Esc\x1b[31mTest"), "Esc[31mTest");
     }
+
+    #[test]
+    fn all_named_component_colors_and_reset_work() {
+        let named = [
+            ("black", Color::Rgb(0x00, 0x00, 0x00)),
+            ("dark_blue", Color::Rgb(0x00, 0x00, 0xAA)),
+            ("dark_green", Color::Rgb(0x00, 0xAA, 0x00)),
+            ("dark_aqua", Color::Rgb(0x00, 0xAA, 0xAA)),
+            ("dark_red", Color::Rgb(0xAA, 0x00, 0x00)),
+            ("dark_purple", Color::Rgb(0xAA, 0x00, 0xAA)),
+            ("gold", Color::Rgb(0xFF, 0xAA, 0x00)),
+            ("gray", Color::Rgb(0xAA, 0xAA, 0xAA)),
+            ("dark_gray", Color::Rgb(0x55, 0x55, 0x55)),
+            ("blue", Color::Rgb(0x55, 0x55, 0xFF)),
+            ("green", Color::Rgb(0x55, 0xFF, 0x55)),
+            ("aqua", Color::Rgb(0x55, 0xFF, 0xFF)),
+            ("red", Color::Rgb(0xFF, 0x55, 0x55)),
+            ("light_purple", Color::Rgb(0xFF, 0x55, 0xFF)),
+            ("yellow", Color::Rgb(0xFF, 0xFF, 0x55)),
+            ("white", Color::Rgb(0xFF, 0xFF, 0xFF)),
+        ];
+
+        for (name, expected) in named {
+            let motd = json!([
+                "",
+                {
+                    "text": "Colored",
+                    "color": name,
+                    "extra": [{ "text": "Reset", "color": "reset" }]
+                }
+            ]);
+            let lines = motd_to_lines(&motd);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].spans[0].style.fg, Some(expected));
+            assert_eq!(lines[0].spans[1].style.fg, None);
+        }
+    }
 }
