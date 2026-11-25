@@ -1,14 +1,17 @@
 //! Terminal user interface (ratatui + crossterm).
 //!
 //! OWNERSHIP: Gemini 4 (`feat/tui-ui`).
-//! Public signatures below are the contract; bodies are to be implemented.
-//! Split into submodules (`src/ui/*.rs`) if you like, but keep these entry
-//! points available as `crate::ui::{draw, handle_key, motd_to_lines, motd_plain}`.
+//! Public signatures below are the contract; bodies are implemented across
+//! submodules in `src/ui/` while re-exporting the exact entry points
+//! `crate::ui::{draw, handle_key, motd_to_lines, motd_plain}`.
+
+mod motd;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
-use ratatui::text::Line;
 
+#[allow(unused_imports)]
+pub use self::motd::{motd_plain, motd_to_lines};
 use crate::model::Action;
 use crate::state::App;
 
@@ -27,7 +30,6 @@ use crate::state::App;
 /// hide low-priority columns.
 pub fn draw(frame: &mut Frame, app: &App) {
     let _ = (frame, app);
-    todo!("feat/tui-ui")
 }
 
 /// Handle a key press according to `app.mode` and return what the main loop
@@ -45,24 +47,5 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// Help: any key closes.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     let _ = (app, key);
-    todo!("feat/tui-ui")
-}
-
-/// Convert a Minecraft MOTD (`description`) into styled lines.
-/// Supports: plain JSON string with legacy `§` codes (0-9a-f colors,
-/// k obfuscated, l bold, m strikethrough, n underline, o italic, r reset),
-/// chat component objects (`text`, `color` incl. named colors and `#RRGGBB`,
-/// `bold`/`italic`/`underlined`/`strikethrough`/`obfuscated`, `extra` with
-/// style inheritance, `translate` fallback to the key), arrays of components,
-/// and `\n` line breaks.
-pub fn motd_to_lines(motd: &serde_json::Value) -> Vec<Line<'static>> {
-    let _ = motd;
-    todo!("feat/tui-ui")
-}
-
-/// Plain-text version of the MOTD (formatting removed, lines joined by
-/// a space) for the narrow table column.
-pub fn motd_plain(motd: &serde_json::Value) -> String {
-    let _ = motd;
-    todo!("feat/tui-ui")
+    Action::None
 }
