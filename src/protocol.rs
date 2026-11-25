@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
@@ -126,8 +128,83 @@ pub fn parse_status_json(
     latency: Duration,
     resolved_endpoint: &str,
 ) -> Result<ServerStatus, ProtocolError> {
-    let _ = (json, latency, resolved_endpoint);
-    todo!("feat/protocol")
+    // Go through `Value` first: derived structs would also accept a JSON
+    // array (as a positional sequence), but a status must be an object.
+    let value: Value = serde_json::from_str(json)?;
+    if !value.is_object() {
+        return Err(ProtocolError::Malformed(
+            "status JSON is not an object".into(),
+        ));
+    }
+    let raw = RawStatus::deserialize(value)?;
+
+    let version = raw.version.unwrap_or_default();
+    let players = raw.players.unwrap_or_default();
+    let player_sample = players
+        .sample
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| p.name)
+        .collect();
+    let has_favicon = match raw.favicon {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    };
+
+    Ok(ServerStatus {
+        version_name: version.name,
+        protocol_version: version.protocol,
+        players_online: players.online,
+        players_max: players.max,
+        player_sample,
+        motd: match raw.description {
+            None | Some(Value::Null) => Value::String(String::new()),
+            Some(v) => v,
+        },
+        latency,
+        has_favicon,
+        resolved_endpoint: resolved_endpoint.to_owned(),
+    })
+}
+
+// Lenient wire structs: every field is optional so that unusual servers
+// (proxies, fakes, very old versions) still produce a usable status.
+
+#[derive(Deserialize)]
+struct RawStatus {
+    #[serde(default)]
+    version: Option<RawVersion>,
+    #[serde(default)]
+    players: Option<RawPlayers>,
+    #[serde(default)]
+    description: Option<Value>,
+    #[serde(default)]
+    favicon: Option<Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawVersion {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    protocol: i32,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPlayers {
+    #[serde(default)]
+    online: i64,
+    #[serde(default)]
+    max: i64,
+    #[serde(default)]
+    sample: Option<Vec<RawSamplePlayer>>,
+}
+
+#[derive(Deserialize)]
+struct RawSamplePlayer {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Perform one complete SLP exchange:
@@ -260,5 +337,101 @@ mod tests {
         let packet = build_handshake("sünucu.example", 1);
         // "sünucu.example" is 15 bytes (ü = 2 bytes), 14 chars.
         assert_eq!(packet[4], 15);
+    }
+
+    const EP: &str = "mc.example.com:25565";
+
+    fn parse(json: &str) -> ServerStatus {
+        parse_status_json(json, Duration::from_millis(42), EP).expect("valid status")
+    }
+
+    #[test]
+    fn parse_vanilla_response() {
+        let json = r#"{
+            "version": {"name": "1.21.4", "protocol": 769},
+            "players": {"max": 20, "online": 2, "sample": [
+                {"name": "Notch", "id": "069a79f4-44e9-4726-a5be-fca90e38aaf5"},
+                {"name": "jeb_", "id": "853c80ef-3c37-49fd-aa49-938b674adae6"}
+            ]},
+            "description": {"text": "A Minecraft Server"},
+            "favicon": "data:image/png;base64,iVBORw0KGgo=",
+            "enforcesSecureChat": true
+        }"#;
+        let st = parse(json);
+        assert_eq!(st.version_name, "1.21.4");
+        assert_eq!(st.protocol_version, 769);
+        assert_eq!(st.players_online, 2);
+        assert_eq!(st.players_max, 20);
+        assert_eq!(st.player_sample, vec!["Notch", "jeb_"]);
+        assert_eq!(st.motd, serde_json::json!({"text": "A Minecraft Server"}));
+        assert_eq!(st.latency, Duration::from_millis(42));
+        assert!(st.has_favicon);
+        assert_eq!(st.resolved_endpoint, EP);
+    }
+
+    #[test]
+    fn parse_string_description_with_section_codes() {
+        let json = r#"{"version":{"name":"Paper 1.21.4","protocol":769},
+            "players":{"max":100,"online":7},
+            "description":"§aWelcome §lto §r§cthe server"}"#;
+        let st = parse(json);
+        assert_eq!(
+            st.motd,
+            Value::String("§aWelcome §lto §r§cthe server".into())
+        );
+        assert!(st.player_sample.is_empty());
+        assert!(!st.has_favicon);
+    }
+
+    #[test]
+    fn parse_chat_component_description() {
+        let json = r#"{"version":{"name":"x","protocol":1},"players":{"max":1,"online":0},
+            "description":{"text":"","extra":[{"text":"Hello ","color":"gold"},{"text":"World","bold":true}]}}"#;
+        let st = parse(json);
+        assert_eq!(
+            st.motd,
+            serde_json::json!({"text":"","extra":[{"text":"Hello ","color":"gold"},{"text":"World","bold":true}]})
+        );
+    }
+
+    #[test]
+    fn parse_missing_players_sample_and_favicon() {
+        let st = parse(r#"{"version":{"name":"1.8.9","protocol":47},"description":"hi"}"#);
+        assert_eq!(st.players_online, 0);
+        assert_eq!(st.players_max, 0);
+        assert!(st.player_sample.is_empty());
+        assert!(!st.has_favicon);
+
+        let st = parse(r#"{"players":{"max":10}}"#);
+        assert_eq!(st.players_online, 0);
+        assert_eq!(st.players_max, 10);
+        assert_eq!(st.version_name, "");
+        assert_eq!(st.protocol_version, 0);
+        assert_eq!(st.motd, Value::String(String::new()));
+    }
+
+    #[test]
+    fn parse_tolerates_nulls_and_nameless_samples() {
+        let st = parse(
+            r#"{"version":null,"players":{"online":1,"max":2,"sample":[{"id":"x"},{"name":"A"}]},
+                "description":null,"favicon":null}"#,
+        );
+        assert_eq!(st.player_sample, vec!["A"]);
+        assert_eq!(st.motd, Value::String(String::new()));
+        assert!(!st.has_favicon);
+        let st = parse(r#"{"players":{"sample":null}}"#);
+        assert!(st.player_sample.is_empty());
+    }
+
+    #[test]
+    fn parse_invalid_json_is_an_error() {
+        for bad in ["", "not json", "{\"version\": "] {
+            let err = parse_status_json(bad, Duration::ZERO, EP).expect_err(bad);
+            assert!(matches!(err, ProtocolError::InvalidJson(_)), "{bad}: {err}");
+        }
+        for bad in ["[]", "42", "\"str\"", "null"] {
+            let err = parse_status_json(bad, Duration::ZERO, EP).expect_err(bad);
+            assert!(matches!(err, ProtocolError::Malformed(_)), "{bad}: {err}");
+        }
     }
 }
