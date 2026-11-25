@@ -446,6 +446,159 @@ address = "localhost"
     }
 
     #[test]
+    fn unparseable_file_is_reported_and_left_untouched() {
+        let tmp = TempDir::new("config-unparseable");
+        let cfg_path = tmp.path().join("config.toml");
+        let original = "servers = \"not an array\"\n";
+        fs::write(&cfg_path, original).expect("write");
+
+        let err = AppConfig::load_or_create(&cfg_path).expect_err("type mismatch");
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
+        assert_eq!(fs::read_to_string(&cfg_path).expect("read back"), original);
+    }
+
+    #[test]
+    fn non_utf8_garbage_fails_while_reading_and_is_not_overwritten() {
+        // Current behaviour: invalid UTF-8 is an I/O error (read stage), not a
+        // TOML parse error. Either way the file is never replaced.
+        let tmp = TempDir::new("config-garbage");
+        let cfg_path = tmp.path().join("config.toml");
+        let garbage: &[u8] = &[0xff, 0xfe, 0x00, 0x81, b'[', 0xc3];
+        fs::write(&cfg_path, garbage).expect("write garbage");
+
+        let err = AppConfig::load_or_create(&cfg_path).expect_err("garbage");
+        match err {
+            ConfigError::Io { path, source } => {
+                assert_eq!(path, cfg_path);
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected ConfigError::Io, got {other:?}"),
+        }
+        assert_eq!(fs::read(&cfg_path).expect("read back"), garbage);
+    }
+
+    #[test]
+    fn path_that_is_a_directory_is_an_io_error() {
+        let tmp = TempDir::new("config-is-dir");
+        let dir_path = tmp.path().join("config.toml");
+        fs::create_dir(&dir_path).expect("create dir");
+
+        let err = AppConfig::load_or_create(&dir_path).expect_err("directory is not a file");
+        match err {
+            ConfigError::Io { path, .. } => assert_eq!(path, dir_path),
+            other => panic!("expected ConfigError::Io, got {other:?}"),
+        }
+        assert!(dir_path.is_dir(), "directory must not be replaced");
+    }
+
+    #[test]
+    fn empty_existing_file_loads_with_no_servers() {
+        // Only a *missing* file gets the default server list; an existing empty
+        // file is valid TOML and yields the field defaults with no servers.
+        let tmp = TempDir::new("config-empty");
+        let cfg_path = tmp.path().join("config.toml");
+        fs::write(&cfg_path, "").expect("write empty");
+
+        let loaded = AppConfig::load_or_create(&cfg_path).expect("empty is valid");
+        assert_eq!(loaded.refresh_interval_secs, DEFAULT_REFRESH_SECS);
+        assert_eq!(loaded.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert!(loaded.servers.is_empty());
+        assert_eq!(fs::read_to_string(&cfg_path).expect("read back"), "");
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_and_dropped_on_save() {
+        // Current behaviour: no `deny_unknown_fields`, so a misspelled key is
+        // silently ignored and falls back to its default.
+        let tmp = TempDir::new("config-unknown-keys");
+        let cfg_path = tmp.path().join("config.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+refresh_interval = 30
+timeout_secs = 7
+
+[[servers]]
+name = "Typo"
+address = "mc.example.com"
+motd = "ignored"
+"#,
+        )
+        .expect("write");
+
+        let loaded = AppConfig::load_or_create(&cfg_path).expect("unknown keys are not an error");
+        assert_eq!(loaded.refresh_interval_secs, DEFAULT_REFRESH_SECS);
+        assert_eq!(loaded.timeout_secs, 7);
+        assert_eq!(
+            loaded.servers,
+            vec![ServerConfig {
+                name: "Typo".into(),
+                address: "mc.example.com".into(),
+                port: None,
+            }]
+        );
+
+        // Saving rewrites the file, so the unknown keys disappear.
+        loaded.save(&cfg_path).expect("save");
+        let rewritten = fs::read_to_string(&cfg_path).expect("read back");
+        assert!(!rewritten.contains("refresh_interval ="), "{rewritten}");
+        assert!(!rewritten.contains("motd"), "{rewritten}");
+    }
+
+    #[test]
+    fn explicit_ports_are_written_and_unset_ports_are_omitted() {
+        let tmp = TempDir::new("config-ports");
+        let cfg_path = tmp.path().join("config.toml");
+        let cfg = AppConfig {
+            servers: vec![
+                ServerConfig {
+                    name: "Explicit".into(),
+                    address: "a.example.net".into(),
+                    port: Some(25570),
+                },
+                ServerConfig {
+                    name: "FromSrv".into(),
+                    address: "b.example.net".into(),
+                    port: None,
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        cfg.save(&cfg_path).expect("save");
+        let text = fs::read_to_string(&cfg_path).expect("read back");
+        assert!(text.contains("port = 25570"), "{text}");
+        assert_eq!(text.matches("port =").count(), 1, "{text}");
+        assert_eq!(AppConfig::load_or_create(&cfg_path).expect("load"), cfg);
+    }
+
+    #[test]
+    fn unicode_and_escaped_server_names_round_trip_through_disk() {
+        let tmp = TempDir::new("config-unicode");
+        let cfg_path = tmp.path().join("config.toml");
+        let cfg = AppConfig {
+            servers: vec![
+                ServerConfig {
+                    name: "サーバー 🚀 Ünïcödé".into(),
+                    address: "jp.example.net".into(),
+                    port: None,
+                },
+                ServerConfig {
+                    name: "Ελληνικά ✓ \"quoted\" back\\slash".into(),
+                    address: "gr.example.net".into(),
+                    port: Some(25565),
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        cfg.save(&cfg_path).expect("save");
+        let text = fs::read_to_string(&cfg_path).expect("utf-8 file");
+        assert!(text.contains("サーバー 🚀 Ünïcödé"), "{text}");
+        assert_eq!(AppConfig::load_or_create(&cfg_path).expect("load"), cfg);
+    }
+
+    #[test]
     fn save_fails_when_parent_is_regular_file() {
         let tmp = TempDir::new("config-unwritable");
         let blocking_file = tmp.path().join("not-a-dir");
