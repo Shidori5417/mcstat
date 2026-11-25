@@ -490,6 +490,36 @@ mod tests {
     }
 
     #[test]
+    fn interval_override_is_never_written_back_to_the_config_file() {
+        let dir = std::env::temp_dir().join(format!("mcstat-cli-override-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        AppConfig {
+            refresh_interval_secs: 30,
+            timeout_secs: 3,
+            servers: vec![server("Seed", 25565)],
+        }
+        .save(&path)
+        .expect("seed config");
+
+        let cli = parse(&["-i", "2"]).expect("flag");
+        let mut app = crate::state::App::new(
+            AppConfig::load_or_create(&path).expect("load"),
+            path.clone(),
+        );
+        app.refresh_interval_secs = cli.refresh_interval_secs(&app.config);
+        assert_eq!(app.refresh_interval_secs, 2, "header shows the override");
+
+        // Any save writes `app.config`, which must still hold the file's value.
+        app.add_server(server("Added", 25566)).expect("save");
+        let on_disk = AppConfig::load_or_create(&path).expect("reload");
+        assert_eq!(on_disk.refresh_interval_secs, 30);
+        assert_eq!(on_disk.servers.len(), 2);
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn config_flag_selects_the_config_path() {
         let cli = parse(&["-c", "custom-mcstat.toml"]).expect("flag");
         assert_eq!(
