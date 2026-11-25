@@ -583,6 +583,10 @@ mod tests {
         WrongId,
         /// Announce a packet bigger than `MAX_PACKET_LEN`.
         Oversized,
+        /// Write these raw bytes after the request, then close.
+        Raw(&'static [u8]),
+        /// Answer the status, then answer the ping with a different payload.
+        WrongPong,
     }
 
     const FAKE_JSON: &str = r#"{"version":{"name":"Fake 1.21","protocol":769},
@@ -625,7 +629,10 @@ mod tests {
                     sock.write_all(&packet(0x42, b"hi")).await.ok()?;
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
-                Fake::Normal | Fake::CloseAfterStatus | Fake::IgnorePing => {
+                Fake::Raw(bytes) => {
+                    sock.write_all(bytes).await.ok()?;
+                }
+                Fake::Normal | Fake::CloseAfterStatus | Fake::IgnorePing | Fake::WrongPong => {
                     let mut body = Vec::new();
                     write_string(&mut body, FAKE_JSON);
                     sock.write_all(&packet(0x00, &body)).await.ok()?;
@@ -634,6 +641,12 @@ mod tests {
                             let (id, payload) = read_packet(&mut sock).await.ok()?;
                             assert_eq!(id, 0x01);
                             sock.write_all(&packet(0x01, &payload)).await.ok()?;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Fake::WrongPong => {
+                            let (id, _) = read_packet(&mut sock).await.ok()?;
+                            assert_eq!(id, 0x01);
+                            sock.write_all(&packet(0x01, &[0u8; 8])).await.ok()?;
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         Fake::IgnorePing => {
@@ -756,6 +769,100 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(matches!(err, ProtocolError::Io(_)), "{err}");
+    }
+
+    #[test]
+    fn parse_forge_status_with_modinfo_and_forge_data() {
+        // Shape of a Forge 1.20.1 server: extra `modinfo` / `forgeData`
+        // objects plus an unknown future field must not disturb parsing.
+        let json = r#"{
+            "version": {"name": "1.20.1", "protocol": 763},
+            "players": {"max": 20, "online": 1, "sample": [
+                {"name": "Steve", "id": "8667ba71-b85a-4004-af54-457a9734eed7"}
+            ]},
+            "description": {"text": "Forge Modded"},
+            "modinfo": {"type": "FML", "modList": [
+                {"modid": "minecraft", "version": "1.20.1"},
+                {"modid": "forge", "version": "47.2.0"}
+            ]},
+            "forgeData": {
+                "channels": [{"res": "fml:handshake", "version": "1.0", "required": true}],
+                "mods": [{"modId": "forge", "modmarker": "47.2.0"}],
+                "fmlNetworkVersion": 2
+            },
+            "enforcesSecureChat": false,
+            "someFutureField": {"nested": [1, 2, 3]}
+        }"#;
+        let st = parse(json);
+        assert_eq!(st.version_name, "1.20.1");
+        assert_eq!(st.protocol_version, 763);
+        assert_eq!((st.players_online, st.players_max), (1, 20));
+        assert_eq!(st.player_sample, vec!["Steve"]);
+        assert_eq!(st.motd, serde_json::json!({"text": "Forge Modded"}));
+        assert!(!st.has_favicon);
+    }
+
+    #[test]
+    fn parse_description_as_array_keeps_all_components() {
+        let json = r#"{"version":{"name":"x","protocol":1},"players":{"max":1,"online":0},
+            "description":[{"text":"Line one","color":"gold"},{"text":"\n"},{"text":"Line two"}]}"#;
+        let st = parse(json);
+        assert_eq!(
+            st.motd,
+            serde_json::json!([
+                {"text": "Line one", "color": "gold"},
+                {"text": "\n"},
+                {"text": "Line two"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_rejects_zero_length_packet() {
+        let (port, _server) = spawn_fake(Fake::Raw(&[0x00])).await;
+        let err = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect_err("zero length");
+        assert!(
+            matches!(&err, ProtocolError::Malformed(msg) if msg.contains("length 0")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_rejects_negative_length_packet() {
+        // VarInt for -1: 0xff 0xff 0xff 0xff 0x0f
+        let (port, _server) = spawn_fake(Fake::Raw(&[0xff, 0xff, 0xff, 0xff, 0x0f])).await;
+        let err = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect_err("negative length");
+        assert!(
+            matches!(&err, ProtocolError::Malformed(msg) if msg.contains("-1")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_reports_truncated_packet_as_io_error() {
+        // Declares 5 bytes, sends 2, then closes.
+        let (port, _server) = spawn_fake(Fake::Raw(&[0x05, 0x00, 0x01])).await;
+        let err = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect_err("truncated");
+        assert!(
+            matches!(&err, ProtocolError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_ignores_pong_with_wrong_payload() {
+        let (port, _server) = spawn_fake(Fake::WrongPong).await;
+        let st = query_status("127.0.0.1", port, "127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .expect("status is still usable");
+        assert_eq!(st.version_name, "Fake 1.21");
+        assert_eq!(st.players_online, 3);
     }
 
     #[test]

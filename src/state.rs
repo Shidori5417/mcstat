@@ -134,6 +134,10 @@ pub struct App {
     pub message: Option<StatusMessage>,
     /// Time of the last full refresh trigger (for "next refresh in" display).
     pub last_refresh: Option<Instant>,
+    /// Refresh interval shown in the header. Starts as the config value; a
+    /// command-line override replaces it for this run only and is never
+    /// written back to `config`, so saving the file keeps the file's value.
+    pub refresh_interval_secs: u64,
     next_id: ServerId,
 }
 
@@ -141,6 +145,7 @@ impl App {
     /// Build state from a loaded config; assigns fresh sequential ids starting
     /// at 1 with state [`ServerState::Unknown`].
     pub fn new(config: AppConfig, config_path: PathBuf) -> Self {
+        let refresh_interval_secs = config.refresh_interval_secs;
         let mut next_id: ServerId = 1;
         let servers = config
             .servers
@@ -166,6 +171,7 @@ impl App {
             config_path,
             message: None,
             last_refresh: None,
+            refresh_interval_secs,
             next_id,
         }
     }

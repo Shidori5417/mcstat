@@ -65,7 +65,9 @@ pub enum ServerState {
     Unknown,
     Online(ServerStatus),
     /// Query failed; human readable reason.
-    Offline { error: String },
+    Offline {
+        error: String,
+    },
 }
 
 /// Result of one poll of one server, sent from the poller to the app.
