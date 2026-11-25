@@ -6,12 +6,16 @@
 //! `crate::ui::{draw, handle_key, motd_to_lines, motd_plain}`.
 
 mod motd;
+mod widgets;
+
+use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 
 #[allow(unused_imports)]
 pub use self::motd::{motd_plain, motd_to_lines};
+use self::widgets::{RenderView, draw_view, wall_clock_millis};
 use crate::model::Action;
 use crate::state::App;
 
@@ -29,7 +33,8 @@ use crate::state::App;
 /// Must be responsive: on narrow terminals stack detail below the table and
 /// hide low-priority columns.
 pub fn draw(frame: &mut Frame, app: &App) {
-    let _ = (frame, app);
+    let view = RenderView::from_app(app);
+    draw_view(frame, &view, Instant::now(), wall_clock_millis());
 }
 
 /// Handle a key press according to `app.mode` and return what the main loop

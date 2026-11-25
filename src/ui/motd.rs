@@ -355,7 +355,6 @@ impl LineBuilder {
 /// `bold`/`italic`/`underlined`/`strikethrough`/`obfuscated`, `extra` with
 /// style inheritance, `translate` fallback to the key), arrays of components,
 /// and `\n` line breaks.
-#[allow(dead_code)]
 pub fn motd_to_lines(motd: &Value) -> Vec<Line<'static>> {
     let mut builder = LineBuilder::new();
     builder.visit(motd, McStyle::default(), 0);
@@ -364,7 +363,6 @@ pub fn motd_to_lines(motd: &Value) -> Vec<Line<'static>> {
 
 /// Plain-text version of the MOTD (formatting removed, lines joined by
 /// a space) for the narrow table column.
-#[allow(dead_code)]
 pub fn motd_plain(motd: &Value) -> String {
     let lines = motd_to_lines(motd);
     let mut parts: Vec<String> = Vec::with_capacity(lines.len());
@@ -383,7 +381,6 @@ pub fn motd_plain(motd: &Value) -> String {
 
 /// Strip legacy `§` formatting codes and control characters from auxiliary
 /// server strings (such as `version.name` or `players.sample` entries).
-#[allow(dead_code)]
 pub(crate) fn strip_legacy_codes(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
