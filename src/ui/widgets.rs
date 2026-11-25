@@ -93,7 +93,7 @@ impl<'a> RenderView<'a> {
             selected: app.selected,
             selected_entry: app.selected_entry(),
             online_count: app.online_count(),
-            refresh_interval_secs: app.config.refresh_interval_secs,
+            refresh_interval_secs: app.refresh_interval_secs,
             last_refresh: app.last_refresh,
             message: app.message.as_ref(),
             mode: &app.mode,
