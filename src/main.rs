@@ -169,11 +169,7 @@ fn setup_terminal() -> io::Result<Tui> {
 
 fn restore_terminal() -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    )?;
+    execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show)?;
     Ok(())
 }
 
