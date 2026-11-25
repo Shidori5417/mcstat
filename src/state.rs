@@ -6,10 +6,13 @@
 //! Adding new pub methods is fine; do not rename/remove existing ones.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::config::{AppConfig, ConfigError};
+use crate::config::{AppConfig, ConfigError, validate_server_input};
 use crate::model::{PollResult, ServerConfig, ServerId, ServerState};
+
+/// Duration after which transient status-bar messages expire.
+const MESSAGE_TTL: Duration = Duration::from_secs(4);
 
 /// One row of the server table.
 #[derive(Debug, Clone)]
@@ -34,10 +37,19 @@ pub enum FormField {
 
 impl FormField {
     pub fn next(self) -> Self {
-        todo!("feat/config-state")
+        match self {
+            Self::Name => Self::Address,
+            Self::Address => Self::Port,
+            Self::Port => Self::Name,
+        }
     }
+
     pub fn prev(self) -> Self {
-        todo!("feat/config-state")
+        match self {
+            Self::Name => Self::Port,
+            Self::Address => Self::Name,
+            Self::Port => Self::Address,
+        }
     }
 }
 
@@ -55,21 +67,35 @@ pub struct AddServerForm {
 impl AddServerForm {
     /// Mutable access to the focused field's text.
     pub fn focused_mut(&mut self) -> &mut String {
-        todo!("feat/config-state")
+        match self.focus {
+            FormField::Name => &mut self.name,
+            FormField::Address => &mut self.address,
+            FormField::Port => &mut self.port,
+        }
     }
+
     /// Append a char to the focused field (Port only accepts ASCII digits,
-    /// max 5 chars). Clears `error`.
+    /// max 5 chars; control chars are ignored). Clears `error` on edit.
     pub fn input_char(&mut self, c: char) {
-        let _ = c;
-        todo!("feat/config-state")
+        if c.is_control() {
+            return;
+        }
+        if self.focus == FormField::Port && (!c.is_ascii_digit() || self.port.len() >= 5) {
+            return;
+        }
+        self.focused_mut().push(c);
+        self.error = None;
     }
+
     /// Delete last char of the focused field. Clears `error`.
     pub fn backspace(&mut self) {
-        todo!("feat/config-state")
+        self.focused_mut().pop();
+        self.error = None;
     }
+
     /// Validate via `config::validate_server_input`.
     pub fn to_server_config(&self) -> Result<ServerConfig, ConfigError> {
-        todo!("feat/config-state")
+        validate_server_input(&self.name, &self.address, &self.port)
     }
 }
 
@@ -112,70 +138,177 @@ pub struct App {
 }
 
 impl App {
-    /// Build state from a loaded config; assigns fresh ids, state Unknown.
+    /// Build state from a loaded config; assigns fresh sequential ids starting
+    /// at 1 with state [`ServerState::Unknown`].
     pub fn new(config: AppConfig, config_path: PathBuf) -> Self {
-        let _ = (config, config_path);
-        todo!("feat/config-state")
+        let mut next_id: ServerId = 1;
+        let servers = config
+            .servers
+            .iter()
+            .map(|server_cfg| {
+                let id = next_id;
+                next_id += 1;
+                ServerEntry {
+                    id,
+                    config: server_cfg.clone(),
+                    state: ServerState::Unknown,
+                    last_updated: None,
+                    refreshing: false,
+                }
+            })
+            .collect();
+
+        Self {
+            servers,
+            selected: 0,
+            mode: Mode::Normal,
+            config,
+            config_path,
+            message: None,
+            last_refresh: None,
+            next_id,
+        }
     }
 
     pub fn selected_entry(&self) -> Option<&ServerEntry> {
-        todo!("feat/config-state")
+        self.servers.get(self.selected)
     }
+
     pub fn select_next(&mut self) {
-        todo!("feat/config-state")
+        if self.servers.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected + 1) % self.servers.len();
+        }
     }
+
     pub fn select_prev(&mut self) {
-        todo!("feat/config-state")
+        if self.servers.is_empty() {
+            self.selected = 0;
+        } else if self.selected == 0 || self.selected >= self.servers.len() {
+            self.selected = self.servers.len() - 1;
+        } else {
+            self.selected -= 1;
+        }
     }
+
     pub fn select_first(&mut self) {
-        todo!("feat/config-state")
+        self.selected = 0;
     }
+
     pub fn select_last(&mut self) {
-        todo!("feat/config-state")
+        self.selected = self.servers.len().saturating_sub(1);
     }
 
-    /// Append a server, select it, persist config to `config_path`.
+    /// Append a server, select it, and persist config to `config_path`.
+    ///
+    /// If saving to disk fails, the in-memory change (`servers`,
+    /// `config.servers`, `selected`, and `next_id`) is rolled back so memory
+    /// and disk stay consistent, and the error is returned.
     pub fn add_server(&mut self, server: ServerConfig) -> Result<ServerId, ConfigError> {
-        let _ = server;
-        todo!("feat/config-state")
+        let id = self.next_id;
+        let prev_selected = self.selected;
+
+        self.config.servers.push(server.clone());
+        if let Err(err) = self.config.save(&self.config_path) {
+            self.config.servers.pop();
+            self.selected = prev_selected;
+            return Err(err);
+        }
+
+        self.next_id += 1;
+        self.servers.push(ServerEntry {
+            id,
+            config: server,
+            state: ServerState::Unknown,
+            last_updated: None,
+            refreshing: false,
+        });
+        self.selected = self.servers.len() - 1;
+        Ok(id)
     }
 
-    /// Remove the server with `id`, fix `selected`, persist config.
-    /// Returns the removed config, `Ok(None)` if no such id.
+    /// Remove the server with `id`, clamp `selected`, and persist config.
+    /// Returns the removed config, or `Ok(None)` if no such id exists.
+    ///
+    /// If saving to disk fails, the in-memory change (`servers`,
+    /// `config.servers`, and `selected`) is rolled back so memory and disk
+    /// stay consistent, and the error is returned.
     pub fn remove_server(&mut self, id: ServerId) -> Result<Option<ServerConfig>, ConfigError> {
-        let _ = id;
-        todo!("feat/config-state")
+        let Some(idx) = self.servers.iter().position(|entry| entry.id == id) else {
+            return Ok(None);
+        };
+
+        let prev_config_servers = self.config.servers.clone();
+        if idx < self.config.servers.len() {
+            self.config.servers.remove(idx);
+        }
+
+        if let Err(err) = self.config.save(&self.config_path) {
+            self.config.servers = prev_config_servers;
+            return Err(err);
+        }
+
+        let removed = self.servers.remove(idx);
+        if self.servers.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.servers.len() {
+            self.selected = self.servers.len() - 1;
+        }
+
+        Ok(Some(removed.config))
     }
 
     /// `(id, config)` pairs for the poller.
     pub fn poll_targets(&self) -> Vec<(ServerId, ServerConfig)> {
-        todo!("feat/config-state")
+        self.servers
+            .iter()
+            .map(|entry| (entry.id, entry.config.clone()))
+            .collect()
     }
 
     /// Mark a server as being polled (ignores unknown ids).
     pub fn mark_refreshing(&mut self, id: ServerId) {
-        let _ = id;
-        todo!("feat/config-state")
+        if let Some(entry) = self.servers.iter_mut().find(|entry| entry.id == id) {
+            entry.refreshing = true;
+        }
     }
 
     /// Apply a poll result (ignores unknown ids, e.g. already deleted).
     pub fn apply_poll_result(&mut self, result: PollResult) {
-        let _ = result;
-        todo!("feat/config-state")
+        if let Some(entry) = self.servers.iter_mut().find(|entry| entry.id == result.id) {
+            entry.state = result.state;
+            entry.last_updated = Some(result.finished_at);
+            entry.refreshing = false;
+        }
     }
 
     pub fn set_message(&mut self, text: impl Into<String>, kind: MessageKind) {
-        let _ = (text.into(), kind);
-        todo!("feat/config-state")
+        self.message = Some(StatusMessage {
+            text: text.into(),
+            kind,
+            created: Instant::now(),
+        });
     }
 
-    /// Drop the status message if older than a few seconds.
+    /// Drop the status message if older than 4 seconds.
     pub fn expire_message(&mut self) {
-        todo!("feat/config-state")
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|msg| msg.created.elapsed() >= MESSAGE_TTL)
+        {
+            self.message = None;
+        }
     }
 
-    /// (online, total) counts for the header.
+    /// `(online, total)` counts for the header.
     pub fn online_count(&self) -> (usize, usize) {
-        todo!("feat/config-state")
+        let online = self
+            .servers
+            .iter()
+            .filter(|entry| matches!(entry.state, ServerState::Online(_)))
+            .count();
+        (online, self.servers.len())
     }
 }
