@@ -1,0 +1,7 @@
+# Read by github.com/Shidori5417 (profile README) and the portfolio site.
+# Edit when the project's state changes; no need to touch it otherwise.
+# status: active | prototype | released | maintenance | paused | archived
+status: active
+focus:
+  en: "Live Minecraft Java server monitor: parallel pings, SRV lookup, a ratatui dashboard and a --once mode for scripts."
+  tr: "Canlı Minecraft Java sunucu izleyicisi: paralel ping, SRV araması, ratatui paneli ve betikler için --once modu."
