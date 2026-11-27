@@ -1,8 +1,4 @@
 //! Shared data contracts used by every module.
-//!
-//! OWNERSHIP: Orchestrator (Opus). Feature branches must NOT change the
-//! existing items in this file. If a branch truly needs a new shared type,
-//! it should add it in its own module instead.
 
 use std::time::{Duration, Instant};
 

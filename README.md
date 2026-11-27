@@ -1,5 +1,8 @@
 # mcstat
 
+[![CI](https://github.com/Shidori5417/mcstat/actions/workflows/ci.yml/badge.svg)](https://github.com/Shidori5417/mcstat/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A live terminal monitor for Minecraft Java Edition servers. It polls every
 configured server in parallel with the Server List Ping protocol and shows
 status, latency, player counts, version and MOTD in a
@@ -57,6 +60,8 @@ mcstat needs Rust 1.88 or newer (Rust edition 2024).
 Install the binary into `~/.cargo/bin`:
 
 ```sh
+cargo install --git https://github.com/Shidori5417/mcstat
+# or from a local checkout:
 cargo install --path .
 ```
 

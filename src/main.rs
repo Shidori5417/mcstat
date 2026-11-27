@@ -1,6 +1,4 @@
 //! mcstat — live Minecraft Java server status monitor in the terminal.
-//!
-//! OWNERSHIP: Orchestrator (Opus). `feat/cli-tests` may wire CLI options in.
 
 mod cli;
 mod config;

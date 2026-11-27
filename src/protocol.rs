@@ -1,8 +1,5 @@
 //! Minecraft Java Edition Server List Ping (SLP) protocol.
 //!
-//! OWNERSHIP: Claude Sonnet (`feat/protocol`).
-//! Public signatures below are the contract; bodies are to be implemented.
-//! Extra private helpers / extra pub items are allowed.
 //! Spec: https://minecraft.wiki/w/Java_Edition_protocol/Server_List_Ping
 
 use std::time::{Duration, Instant};
