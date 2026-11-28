@@ -1,8 +1,7 @@
 //! Terminal user interface (ratatui + crossterm).
 //!
-//! OWNERSHIP: Gemini 4 (`feat/tui-ui`).
-//! Public signatures below are the contract; bodies are implemented across
-//! submodules in `src/ui/` while keeping the entry points available as
+//! Submodules under `src/ui/` implement input handling, MOTD rendering,
+//! popups and widgets while keeping the public entry points available as
 //! `crate::ui::{draw, handle_key, motd_to_lines, motd_plain}`.
 
 mod input;

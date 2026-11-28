@@ -1,7 +1,4 @@
 //! Persistent configuration (TOML).
-//!
-//! OWNERSHIP: Neon (`feat/config-state`).
-//! Public signatures below are the contract; bodies are to be implemented.
 
 use std::ffi::OsString;
 use std::fs;

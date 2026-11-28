@@ -1,9 +1,4 @@
 //! Application state.
-//!
-//! OWNERSHIP: Neon (`feat/config-state`).
-//! The struct FIELDS and public method signatures below are the contract the
-//! UI (`ui.rs`) and `main.rs` are written against. Implement the bodies.
-//! Adding new pub methods is fine; do not rename/remove existing ones.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

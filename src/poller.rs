@@ -1,8 +1,5 @@
 //! Concurrent background poller.
 //!
-//! OWNERSHIP: Hydrogen (`feat/async-poller`).
-//! Public signatures below are the contract; bodies are to be implemented.
-//!
 //! Responsibilities:
 //! - Every `interval`, poll all servers concurrently (`tokio::spawn` per
 //!   server or a JoinSet), never blocking the UI.
